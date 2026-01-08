@@ -1,6 +1,6 @@
 ---
 julia:
-    execflags: 
+    execflags:
       - "--project=."
 ---
  
@@ -344,7 +344,7 @@ adpc_aseq = @chain adpc_chg begin
            groupby([:STUDYID, :USUBJID])
            @transform :ASEQ = 1:length(:STUDYID)
 
-           @select(Not([:DOMAIN, :PCSEQ, :DRUG, :EVID, :AXRLT, :NXRLT]))
+           @select(Not([:DOMAIN, :PCSEQ]))
            @select(Not(r"^orig"))
            @select(Not(r"^min"))
            @select(Not(r"^max"))
@@ -361,5 +361,9 @@ adpc_aseq = @chain adpc_chg begin
 for col in names(adpc_aseq)
     adpc_aseq[!, col] = replace(adpc_aseq[!, col], missing => "missing")
 end
+```
+
+```{julia}
+adpc_aseq_sorted = sort(adpc_aseq,[:STUDYID, :USUBJID, :DRUG, :ADTM, :EVID])
 ```
 

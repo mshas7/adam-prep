@@ -1,0 +1,518 @@
+---
+julia:
+    execflags: 
+      - "--project=."
+---
+
+## Importing Packages
+
+```{julia}
+using DataFramesMeta
+using ReadStatTables
+using Statistics
+using Dates
+include("con1-fun.jl")
+```
+
+## Define the path and load the data
+
+```{julia}
+path = joinpath(@__DIR__ ,"..","..","datasets","source","CDISCPILOT01")
+pc = @chain readstat(joinpath(path, "pc.xpt")) DataFrame convert_blanks_to_missing
+ex = @chain readstat(joinpath(path, "ex.xpt")) DataFrame convert_blanks_to_missing
+vs = @chain readstat(joinpath(path, "vs.xpt")) DataFrame convert_blanks_to_missing
+lb = @chain readstat(joinpath(path, "lb.xpt")) DataFrame convert_blanks_to_missing
+adsl = @chain readstat(joinpath(path, "adsl.xpt")) DataFrame convert_blanks_to_missing
+country_code_lookup = @chain readstat(joinpath(path, "ccl.xpt")) DataFrame convert_blanks_to_missing
+```
+
+```{julia}
+param_lookup = DataFrame(
+    PCTESTCD = ["XAN", "DOSE"],
+    PARAMCD = ["XAN", "DOSE"],
+    PARAM = ["Pharmacokinetic concentration of Xanomeline", "Xanomeline Patch Dose"],
+    PARAMN = [1, 2]
+)
+
+dose_freq_lookup = DataFrame(
+    CDISC_VALUE = ["QD", "BID", "TID", "QID"],
+    HOURS_BETWEEN_DOSES = [24, 12, 8, 6]
+)
+adsl_subset = @chain adsl begin
+    @select :STUDYID :USUBJID :TRTSDT :TRTSDTM :TRT01P :TRT01A
+end
+```
+
+</details>
+<details>
+<summary>PC DATA PREPARATION</summary>
+
+
+## PC data preparation
+
+```{julia}
+pc_prep = @chain pc begin
+    leftjoin(adsl_subset, on = [:STUDYID, :USUBJID])
+
+    @rtransform :ADTM = parse_datetime_column(:PCDTC)
+    @rtransform :ADT = Date(:ADTM)
+    @rtransform :ATM = Time(:ADTM)
+    @rtransform :ADY = Dates.value(:ADT - :TRTSDT) + 1
+    
+    @rtransform begin
+        :EVID = 0
+        :DRUG = :PCTEST
+        :NFRLT = :PCTPTNUM < 0 ? 0 : :PCTPTNUM 
+    end
+end
+```
+
+</details>
+<details>
+<summary>Ex Data preparation</summary>
+
+
+## ex data Prep
+
+```{julia}
+ex_prep = @chain ex begin
+    leftjoin(adsl_subset, on = [:STUDYID, :USUBJID])
+
+    @rsubset :EXDOSE > 0
+
+    @rtransform :ASTDTM = parse_datetime_column(:EXSTDTC)
+    @rtransform @passmissing :AENDTM = parse_datetime_column(:EXENDTC)
+    @rtransform :ASTDT = Date(:ASTDTM)
+    @rtransform @passmissing :AENDT = Date(:AENDTM)
+    @rtransform :AENDTM = ismissing(:AENDTM) ? :ASTDTM : :AENDTM
+
+    @rtransform begin
+        :EVID = 1
+        :NFRLT = :VISITDY == 1 ? 0 : 24 * :VISITDY
+    end
+end
+```
+
+</details>
+<details>
+<summary>Expanding Dose</summary>
+
+## EXPANDING DOSE
+
+```{julia}
+ex_exp = @chain ex_prep begin
+
+    leftjoin(dose_freq_lookup, on = [:EXDOSFRQ => :CDISC_VALUE])
+    expand_dose_dataframe
+
+    @rtransform :AVISIT = "Day $(:AVISITN)"
+    @rtransform :DRUG = :EXTRT
+
+    @rtransform :ADT = Date(:ADTM)
+    @rtransform :ATM = Time(:ADTM)
+    @rtransform :ASTTM = Time(:ASTDTM)
+    @rtransform :AENTM = Time(:AENDTM)
+    @rtransform :ADY = Dates.value(:ADT - :TRTSDT) + 1
+end           
+```
+
+## Derive FIRST-dose EX variables
+
+```{julia}
+ex_first = @chain ex_exp begin
+    @rsubset(!ismissing(:ADTM))
+    sort([:STUDYID, :USUBJID, :DRUG, :ADTM, :EXSEQ])
+    groupby([:STUDYID, :USUBJID, :DRUG])
+    combine(first,
+        :ADTM   => :FANLDTM,
+        :EXDOSE => :EXDOSE_first
+    )
+end
+```
+
+## Merge with pc_dates and filter
+
+```{julia}
+ex_first_sel = @chain ex_first begin
+    @rselect(:STUDYID, :USUBJID, :DRUG, :FANLDTM, :EXDOSE_first)
+end
+
+```
+
+```{julia}
+adppk_first_dose = @chain pc_prep begin
+    leftjoin(ex_first_sel, on = [:STUDYID, :USUBJID, :DRUG])
+    @rsubset(!ismissing(:FANLDTM))
+end
+```
+
+## Derive AVISITN and AVISIT
+
+```{julia}
+adppk_first_dose = @chain adppk_first_dose begin
+    @rtransform :AVISITN = (:NFRLT ÷ 24) + 1
+    @rtransform :AVISIT  = "Day " .* string.(:AVISITN)
+end
+```
+
+## Find Previous Dose
+
+```{julia}
+ex_expanded = expand_dose_dataframe(ex_exp)
+```
+
+
+```{julia}
+adppk_prev = find_previous_dose(
+    adppk_first_dose,
+    ex_expanded
+)
+```
+
+
+```{julia}
+adppk_nom_prev = find_previous_nominal_dose(
+    adppk_prev,
+    ex_expanded
+)
+```
+
+## Combine PC and EX Records for ADPPK
+
+```{julia}
+stacked = vcat(adppk_nom_prev, ex_exp; cols = :union)
+anchors = @chain stacked begin
+    groupby([:USUBJID, :DRUG])
+    combine(
+        :FANLDTM => (x -> minimum(skipmissing(x))) => :FANLDTM,
+        :NFRLT   => (x -> minimum(skipmissing(x))) => :min_NFRLT,
+        [:ADT, :EVID] => ((adt, evid) ->
+            maximum(skipmissing(adt[evid .== 0]))
+        ) => :maxdate
+    )
+end
+```
+
+```{julia}
+stacked_clean = @chain stacked begin
+    @rselect(Not(:FANLDTM))
+end
+```
+
+## Compute subject/drug-level anchors
+
+```{julia}
+adppk_aprlt = @chain stacked_clean begin
+    leftjoin(anchors, on = [:USUBJID, :DRUG])
+    sort([:USUBJID, :ADTM])
+    @rsubset(:ADT <= :maxdate)
+
+    @rtransform :AFRLT = Dates.value(:ADTM - :FANLDTM) / 3600000
+    @rtransform :APRLT = ismissing(:ADTM) || ismissing(:ADTM_prev) ?
+                         missing : Dates.value(:ADTM - :ADTM_prev) / 3600000
+
+end
+```
+
+## Derive Analysis Variables and Dependent Variable
+
+```{julia}
+adppk_aval = @chain adppk_aprlt begin
+    @rtransform begin
+        :DOSEA = ifelse(
+            :EVID == 1,
+            :EXDOSE,
+            ifelse(ismissing(:EXDOSE_prev), :EXDOSE_first, :EXDOSE_prev)
+        )
+    end
+
+   @rtransform begin
+    :DOSEP = ifelse(
+            :TRT01P == "Xanomeline High Dose", 81,
+            ifelse(:TRT01P == "Xanomeline Low Dose", 54,
+                   ifelse(:TRT01P == "Placebo", 0, missing))
+        )
+    end
+
+    @rtransform :PARAMCD = ifelse(:EVID == 1, "DOSE", :PCTESTCD)
+
+    @rtransform :ALLOQ = :PCLLOQ
+
+    @rtransform begin
+    :CMT =
+    ifelse(
+        :EVID == 1,
+        1,
+        ifelse(!ismissing(:PCSPEC) && :PCSPEC == "PLASMA", 2, 3)
+    )
+    end
+    
+    @rtransform :BLQFL =
+    ifelse(!ismissing(:PCSTRESC) && :PCSTRESC == "<BLQ", "Y", "N")
+
+    @rtransform :BLQFN =
+    ifelse(!ismissing(:PCSTRESC) && :PCSTRESC == "<BLQ", 1, 0)
+
+    @rtransform :AMT = ifelse(:EVID == 1, :EXDOSE, missing)
+    @rtransform :DV   = :PCSTRESN
+    @rtransform :AVAL = :DV
+
+    @rtransform :DVL = ifelse(!ismissing(:DV) && :DV != 0, log(:DV), missing)
+    @rtransform :MDV = ifelse(
+            :EVID == 1 || ismissing(:DV), 1, 0
+        )
+
+    @rtransform :AVALU = ifelse(:EVID == 1, missing, :PCSTRESU)
+
+    @rtransform :UDTC = ismissing(:ADTM) ? missing : Dates.format(:ADTM, dateformat"yyyy-mm-ddTHH:MM:SS")
+
+    @rtransform :II = ifelse(:EVID == 1, 1, 0)
+    @rtransform :SS = ifelse(:EVID == 1, 1, 0)
+end
+```
+
+## Add ASEQ and Remove Temporary Variables
+
+```{julia}
+adppk_aseq = @chain adppk_aval begin
+    sort([:STUDYID, :USUBJID, :AFRLT, :EVID, :CMT])
+    groupby([:STUDYID, :USUBJID])
+    @rtransform :ASEQ = eachindex(:USUBJID)
+end
+```
+
+## Derive PARAM and PARAMN
+
+```{julia}
+param_lkp = @chain param_lookup begin
+    @rselect(Not(:PCTESTCD))
+end
+
+adppk_aseq = @chain adppk_aseq begin
+    leftjoin(param_lkp, on = :PARAMCD)
+end
+```
+
+## Add PROJID and PROJIDN
+
+```{julia}
+adppk_aseq = @chain adppk_aseq begin
+    @rtransform begin
+        :PROJID  = :DRUG
+        :PROJIDN = 1
+    end
+end
+```
+
+## Remove temporary variables
+
+```{julia}
+adppk_aseq = @chain adppk_aseq begin
+    @rselect(
+        Not(
+            r"^DOMAIN$|
+              ^min|
+              ^max|
+              ^EX|
+              ^PC|
+              first$|
+              prev$|
+              DTM$|
+              DT$|
+              TM$|
+              ^VISIT|
+              ^AVISIT|
+              TMF$|
+              ^TRT|
+              ^ATPT|
+              ^DRUG$"x
+        )
+    )
+end
+```
+
+
+```{julia}
+country_code_lookup = rename(country_code_lookup, :country_code => :COUNTRY)
+
+```
+
+## Derive Numeric Covariates
+
+```{julia}
+
+covar = @chain adsl begin
+    leftjoin(_,country_code_lookup, on = [:COUNTRY])
+    @rtransform begin
+        :STUDYIDN = tryparse(Int, split(:USUBJID, "-")[1])
+        :SITEIDN  = tryparse(Int, split(:USUBJID, "-")[2])
+        :USUBJIDN = tryparse(Int, split(:USUBJID, "-")[3])
+        :SUBJIDN  = tryparse(Int, string(:SUBJID))
+    end
+
+   @rtransform begin
+    :SEXN = ifelse(
+        :SEX == "M", 1,
+        ifelse(:SEX == "F", 2, 3)
+    )
+end
+
+
+    @rtransform :RACEN = ifelse(:RACE == "AMERICAN INDIAN OR ALASKA NATIVE", 1,
+                  ifelse(:RACE == "ASIAN", 2,
+                  ifelse(:RACE == "BLACK OR AFRICAN AMERICAN", 3,
+                  ifelse(:RACE == "NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER", 4,
+                  ifelse(:RACE == "WHITE", 5, 6)))))
+
+    @rtransform :ETHNICN = ifelse(:ETHNIC == "HISPANIC OR LATINO", 1,
+                    ifelse(:ETHNIC == "NOT HISPANIC OR LATINO", 2, 3))
+
+    @rtransform :ARMN = ifelse(:ARM == "Placebo", 0,
+                 ifelse(:ARM == "Xanomeline Low Dose", 1,
+                 ifelse(:ARM == "Xanomeline High Dose", 2, 3)))
+
+    @rtransform :ACTARMN = ifelse(:ACTARM == "Placebo", 0,
+                    ifelse(:ACTARM == "Xanomeline Low Dose", 1,
+                    ifelse(:ACTARM == "Xanomeline High Dose", 2, 3)))
+
+    @rtransform :COHORT  = :ARMN
+    @rtransform :COHORTC = :ARM
+
+    @rtransform :ROUTE  = first(skipmissing(ex.EXROUTE))
+    @rtransform :ROUTEN = ifelse(:ROUTE == "TRANSDERMAL", 3, missing)
+
+    @rtransform :FORM  = first(skipmissing(ex.EXDOSFRM))
+    @rtransform :FORMN = ifelse(:FORM == "PATCH", 3, 4)
+
+    @rselect(
+        :STUDYID, :STUDYIDN,
+        :SITEID,  :SITEIDN,
+        :USUBJID, :USUBJIDN,
+        :SUBJID,  :SUBJIDN,
+        :AGE,
+        :SEX, :SEXN,
+        :COHORT, :COHORTC,
+        :ROUTE, :ROUTEN,
+        :RACE, :RACEN,
+        :ETHNIC, :ETHNICN,
+        :FORM, :FORMN,
+        :COUNTRY, :country_name, :country_number
+    )
+end
+```
+
+## Derive additional baselines from VS and LB
+### baseline labs
+
+```{julia}
+labsbl = @chain lb begin
+    @rsubset(
+        !ismissing(:LBBLFL) && :LBBLFL == "Y" &&
+        !ismissing(:LBTESTCD) &&
+        :LBTESTCD in ["CREAT", "ALT", "AST", "BILI"]
+    )
+    @rtransform :LBTESTCDB = string(:LBTESTCD, "BL")
+    @rselect(:STUDYID, :USUBJID, :LBTESTCDB, :LBSTRESN)
+end
+```
+
+## Merge HEIGHT baseline from VS
+
+```{julia}
+vs_ht = @chain vs begin
+    @rsubset(:VSTESTCD == "HEIGHT")
+    @rselect(:STUDYID, :USUBJID, :VSSTRESN)
+    rename(:VSSTRESN => :HTBL)
+end
+```
+
+## Merge WEIGHT baseline from VS
+
+```{julia}
+vs_wt = @chain vs begin
+    @rsubset(:VSTESTCD == "WEIGHT" && :VSBLFL == "Y")
+    @rselect(:STUDYID, :USUBJID, :VSSTRESN)
+    rename(:VSSTRESN => :WTBL)
+end
+```
+
+## Merge HEIGHT & WEIGHT into covar
+
+```{julia}
+covar_vslb = @chain covar begin
+    leftjoin(vs_ht, on = [:STUDYID, :USUBJID])
+    leftjoin(vs_wt, on = [:STUDYID, :USUBJID])
+end
+```
+
+## Transpose lab baselines wide
+
+```{julia}
+labsbl_wide = unstack(
+    labsbl,
+    [:STUDYID, :USUBJID],
+    :LBTESTCDB,
+    :LBSTRESN
+)
+```
+
+## Join labs to covariates
+
+```{julia}
+covar_vslb = @chain covar_vslb begin
+    leftjoin(labsbl_wide, on = [:STUDYID, :USUBJID])
+end
+```
+
+## Derive BMI, BSA, CRCL, eGFR
+
+```{julia}
+covar_vslb = @chain covar_vslb begin
+    @rtransform begin
+        :BMIBL = compute_bmi(height = :HTBL, weight = :WTBL)
+
+        :BSABL = compute_bsa(
+            height = :HTBL,
+            weight = :WTBL,
+            method = "Mosteller"
+        )
+
+        :CRCLBL = compute_egfr(
+            creat = :CREATBL,
+            creatu = "SI",
+            age = :AGE,
+            weight = :WTBL,
+            sex = :SEX,
+            method = "CRCL"
+        )
+
+        :EGFRBL = compute_egfr(
+            creat = :CREATBL,
+            creatu = "SI",
+            age = :AGE,
+            weight = :WTBL,
+            sex = :SEX,
+            method = "CKD-EPI"
+        )
+    end
+end
+```
+
+```{julia}
+rename!(covar_vslb, :BILIBL => :TBILBL)
+```
+
+## Combine covariates with APPPK data
+
+```{julia}
+adppk = @chain adppk_aseq begin
+    leftjoin(
+        covar_vslb,
+        on = [:STUDYID, :USUBJID]
+    )
+
+    sort([:STUDYIDN, :USUBJIDN, :AFRLT, :EVID])
+
+    @rtransform :RECSEQ = eachindex(:USUBJID)
+end
+```
