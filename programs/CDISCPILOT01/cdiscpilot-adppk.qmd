@@ -11,6 +11,7 @@ using DataFramesMeta
 using ReadStatTables
 using Statistics
 using Dates
+using CSV
 include("con1-fun.jl")
 ```
 
@@ -54,6 +55,7 @@ end
 pc_prep = @chain pc begin
     leftjoin(adsl_subset, on = [:STUDYID, :USUBJID])
 
+    @rsubset :PCSPEC == "PLASMA"
     @rtransform :ADTM = parse_datetime_column(:PCDTC)
     @rtransform :ADT = Date(:ADTM)
     @rtransform :ATM = Time(:ADTM)
@@ -64,6 +66,7 @@ pc_prep = @chain pc begin
         :DRUG = :PCTEST
         :NFRLT = :PCTPTNUM < 0 ? 0 : :PCTPTNUM 
     end
+        @orderby :STUDYID :USUBJID :DRUG :ADTM 
 end
 ```
 
@@ -85,11 +88,17 @@ ex_prep = @chain ex begin
     @rtransform :ASTDT = Date(:ASTDTM)
     @rtransform @passmissing :AENDT = Date(:AENDTM)
     @rtransform :AENDTM = ismissing(:AENDTM) ? :ASTDTM : :AENDTM
+    @rtransform :DRUG = :EXTRT
 
     @rtransform begin
         :EVID = 1
         :NFRLT = :VISITDY == 1 ? 0 : 24 * :VISITDY
     end
+    @orderby :STUDYID :USUBJID :DRUG :ASTDTM 
+    transform(groupby(_, [:STUDYID, :USUBJID, :DRUG]),
+        :ASTDTM   =>  (x -> first(skipmissing(x))) => :FANLDTM,
+        :EXDOSE =>  (x -> first(skipmissing(x))) => :EXDOSE_first
+    )
 end
 ```
 
@@ -99,6 +108,7 @@ end
 
 ## EXPANDING DOSE
 
+
 ```{julia}
 ex_exp = @chain ex_prep begin
 
@@ -106,66 +116,48 @@ ex_exp = @chain ex_prep begin
     expand_dose_dataframe
 
     @rtransform :AVISIT = "Day $(:AVISITN)"
-    @rtransform :DRUG = :EXTRT
 
     @rtransform :ADT = Date(:ADTM)
     @rtransform :ATM = Time(:ADTM)
     @rtransform :ASTTM = Time(:ASTDTM)
     @rtransform :AENTM = Time(:AENDTM)
     @rtransform :ADY = Dates.value(:ADT - :TRTSDT) + 1
+
+
 end           
 ```
 
+
+
 ## Derive FIRST-dose EX variables
 
+
 ```{julia}
-ex_first = @chain ex_exp begin
-    @rsubset(!ismissing(:ADTM))
-    sort([:STUDYID, :USUBJID, :DRUG, :ADTM, :EXSEQ])
-    groupby([:STUDYID, :USUBJID, :DRUG])
-    combine(first,
-        :ADTM   => :FANLDTM,
-        :EXDOSE => :EXDOSE_first
-    )
+adppk_first_dose = @chain ex_exp begin
+
+    @rsubset :EXDOSE > 0 && !ismissing(:ADTM)
+
+    combine(groupby(_,[:STUDYID, :USUBJID, :DRUG]),:ADTM => (x->minimum(x)) => :FANLDTM)
+
+    leftjoin(pc_prep,_,on = [:STUDYID, :USUBJID, :DRUG], makeunique=true)
+
+    # @rsubset !ismissing(:FANLDTM)
+
+    @rtransform :AVISITN = (:NFRLT ÷ 24) + 1
+    @rtransform :AVISIT = "Day $(:AVISITN)"
 end
 ```
 
-## Merge with pc_dates and filter
 
-```{julia}
-ex_first_sel = @chain ex_first begin
-    @rselect(:STUDYID, :USUBJID, :DRUG, :FANLDTM, :EXDOSE_first)
-end
-
-```
-
-```{julia}
-adppk_first_dose = @chain pc_prep begin
-    leftjoin(ex_first_sel, on = [:STUDYID, :USUBJID, :DRUG])
-    @rsubset(!ismissing(:FANLDTM))
-end
-```
 
 ## Derive AVISITN and AVISIT
-
-```{julia}
-adppk_first_dose = @chain adppk_first_dose begin
-    @rtransform :AVISITN = (:NFRLT ÷ 24) + 1
-    @rtransform :AVISIT  = "Day " .* string.(:AVISITN)
-end
-```
-
 ## Find Previous Dose
-
-```{julia}
-ex_expanded = expand_dose_dataframe(ex_exp)
-```
 
 
 ```{julia}
 adppk_prev = find_previous_dose(
     adppk_first_dose,
-    ex_expanded
+    ex_exp
 )
 ```
 
@@ -173,7 +165,7 @@ adppk_prev = find_previous_dose(
 ```{julia}
 adppk_nom_prev = find_previous_nominal_dose(
     adppk_prev,
-    ex_expanded
+    ex_exp
 )
 ```
 
@@ -181,16 +173,24 @@ adppk_nom_prev = find_previous_nominal_dose(
 
 ```{julia}
 stacked = vcat(adppk_nom_prev, ex_exp; cols = :union)
+
+```
+
+```{julia}
 anchors = @chain stacked begin
     groupby([:USUBJID, :DRUG])
     combine(
-        :FANLDTM => (x -> minimum(skipmissing(x))) => :FANLDTM,
-        :NFRLT   => (x -> minimum(skipmissing(x))) => :min_NFRLT,
-        [:ADT, :EVID] => ((adt, evid) ->
-            maximum(skipmissing(adt[evid .== 0]))
-        ) => :maxdate
+        :FANLDTM => (x -> isempty(skipmissing(x)) ? missing : minimum(skipmissing(x))) => :FANLDTM,
+
+        :NFRLT   => (x -> isempty(skipmissing(x)) ? missing : minimum(skipmissing(x))) => :min_NFRLT,
+
+        [:ADT, :EVID] => ((adt, evid) -> begin
+            idx = evid .== 0
+            isempty(adt[idx]) ? missing : maximum(skipmissing(adt[idx]))
+        end) => :maxdate
     )
 end
+
 ```
 
 ```{julia}
@@ -205,13 +205,19 @@ end
 adppk_aprlt = @chain stacked_clean begin
     leftjoin(anchors, on = [:USUBJID, :DRUG])
     sort([:USUBJID, :ADTM])
-    @rsubset(:ADT <= :maxdate)
+    @rsubset(!ismissing(:ADT) && !ismissing(:maxdate) && :ADT <= :maxdate)
 
-    @rtransform :AFRLT = Dates.value(:ADTM - :FANLDTM) / 3600000
-    @rtransform :APRLT = ismissing(:ADTM) || ismissing(:ADTM_prev) ?
-                         missing : Dates.value(:ADTM - :ADTM_prev) / 3600000
+    @rtransform :AFRLT =
+        ismissing(:ADTM) || ismissing(:FANLDTM) ?
+        missing :
+        Dates.value(:ADTM - :FANLDTM) / 3600000
 
+    @rtransform :APRLT =
+        ismissing(:ADTM) || ismissing(:ADTM_prev) ?
+        missing :
+        Dates.value(:ADTM - :ADTM_prev) / 3600000
 end
+
 ```
 
 ## Derive Analysis Variables and Dependent Variable
@@ -219,7 +225,8 @@ end
 ```{julia}
 adppk_aval = @chain adppk_aprlt begin
     @rtransform begin
-        :DOSEA = ifelse(
+        :DOSEA =
+        ifelse(
             :EVID == 1,
             :EXDOSE,
             ifelse(ismissing(:EXDOSE_prev), :EXDOSE_first, :EXDOSE_prev)
@@ -513,6 +520,16 @@ adppk = @chain adppk_aseq begin
 
     sort([:STUDYIDN, :USUBJIDN, :AFRLT, :EVID])
 
+    @rtransform :APRLT = ismissing(:APRLT) ? :AFRLT : :APRLT
     @rtransform :RECSEQ = eachindex(:USUBJID)
 end
+```
+
+```{julia}
+out = joinpath(@__DIR__, "..", "..", "datasets", "derived")
+```
+
+
+```{julia}
+CSV.write(joinpath(out, "adppk.csv"), adppk)
 ```
