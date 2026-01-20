@@ -137,7 +137,7 @@ adppk_first_dose = @chain ex_exp begin
 
     @rsubset :EXDOSE > 0 && !ismissing(:ADTM)
 
-    combine(groupby(_,[:STUDYID, :USUBJID, :DRUG]),:ADTM => (x->minimum(x)) => :FANLDTM)
+    DataFrames.combine(groupby(_,[:STUDYID, :USUBJID, :DRUG]),:ADTM => (x->minimum(x)) => :FANLDTM)
 
     leftjoin(pc_prep,_,on = [:STUDYID, :USUBJID, :DRUG], makeunique=true)
 
@@ -179,7 +179,7 @@ stacked = vcat(adppk_nom_prev, ex_exp; cols = :union)
 ```{julia}
 anchors = @chain stacked begin
     groupby([:USUBJID, :DRUG])
-    combine(
+    DataFrames.combine(
         :FANLDTM => (x -> isempty(skipmissing(x)) ? missing : minimum(skipmissing(x))) => :FANLDTM,
 
         :NFRLT   => (x -> isempty(skipmissing(x)) ? missing : minimum(skipmissing(x))) => :min_NFRLT,
