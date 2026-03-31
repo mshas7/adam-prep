@@ -1,0 +1,685 @@
+---
+julia:
+    execflags: 
+      - "--project=."
+---
+
+## Load the packages
+
+
+```{julia}
+using DataFramesMeta
+using CSV
+using ReadStatTables
+using Statistics
+using CairoMakie
+using AlgebraOfGraphics
+using PairPlots
+using ColorSchemes
+using StyledStrings
+using SummaryTables
+using PairPlots
+include(joinpath(@__DIR__,"table-one-mod.jl"))
+include(joinpath(@__DIR__,"pairplot-with-regression.jl"))
+include(joinpath(@__DIR__,"boxplot-with-stats.jl"))
+include(joinpath(@__DIR__,"coerce_string_columns.jl"))
+include(joinpath(@__DIR__,"eta-corr.jl"))
+include(joinpath(@__DIR__,"gof.jl"))
+include(joinpath(@__DIR__,"indiv-fits.jl"))
+include(joinpath(@__DIR__,"model-comparison-table.jl"))
+# include(joinpath(@__DIR__,"ParameterTables.jl")
+include(joinpath(@__DIR__,"plot-fun.jl"))
+include(joinpath(@__DIR__,"session-info.jl"))
+```
+
+## Initialize the dataset and result directories
+
+```{julia}
+# Set relative paths to directories (start from the project folder)
+proj_dir = string(chomp(read(`git rev-parse --show-toplevel`, String))) # Get the root git folder
+pumasai_repo = basename(realpath(proj_dir))
+data_dir = joinpath(proj_dir,  "datasets")
+results_dir = joinpath(proj_dir, "results")
+sdata_dir = joinpath(data_dir, "source")
+ddata_dir = joinpath(data_dir, "derived")
+
+# Specify the Quarto file specific directories
+qmd_dir, qmd_name = splitdir(@__FILE__)
+qmd_prefix, _ = splitext(qmd_name)
+task_results_dir = joinpath(results_dir, basename(realpath(qmd_dir)))
+qmd_results_dir = joinpath(task_results_dir, qmd_prefix)
+mdl_dir = joinpath(qmd_dir, "pumas")
+julia_fns_dir = joinpath(qmd_dir, "julia-functions")
+
+# Specify the qmd relative path to program and default source info
+qmd_relative_path = lstrip(split(@__FILE__, pumasai_repo)[end], '/')
+
+# Initialize results directory
+# include(joinpath(utils_dir, "init-dir.jl"))
+# init_dir(joinpath(qmd_results_dir))
+```
+
+## Specify text strings to be used as program and source references in footnotes to tables and figures created by this Quarto program.
+
+```{julia}
+# Text specifying relative paths to program and default source info
+# Program path
+prog_ref = string("Program: ", qmd_relative_path)
+
+# Relative path to Source path: QMD HTML 
+qmd_html = string(qmd_prefix, ".html")
+qmd_html_path = joinpath(
+    dirname(qmd_relative_path),
+    qmd_html
+)
+qmd_html_ref = string("Source: ", qmd_html_path)
+
+# Specify relative path to the QMD results directory
+# This should be used to construct the Source reference for TLFs
+qmd_results_path = replace(qmd_relative_path, "programs" => "results")
+```
+
+## Setting Plots theme
+
+```{julia}
+my_theme = Theme(
+    Axis=(
+        yminorticks=IntervalsBetween(2),
+        yminorgridvisible=true,
+        xminorticks=IntervalsBetween(2),
+        xminorgridvisible=true,
+        xlabelfont=:bold,
+        ylabelfont=:bold,
+        leftspinecolor=:gray60,
+        rightspinecolor=:gray60,
+        topspinecolor=:gray60,
+        bottomspinecolor=:gray60,
+    )
+)
+
+my_log_theme = Theme(
+    Axis=(
+        yminorgridvisible=true,
+        xminorticks=IntervalsBetween(2),
+        xminorgridvisible=true,
+        xlabelfont=:bold,
+        ylabelfont=:bold,
+        leftspinecolor=:gray60,
+        rightspinecolor=:gray60,
+        topspinecolor=:gray60,
+        bottomspinecolor=:gray60,
+        yscale=log10,
+        yminorticks=IntervalsBetween(10),
+        ytickformat=x -> string.(round.(x, digits=1)),
+    )
+)
+
+set_theme!(my_theme)
+```
+
+## Load the data
+
+```{julia}
+path = joinpath(@__DIR__ ,"..","..","datasets","derived")
+adppk = CSV.read(
+    joinpath(path, "adppk.csv"),
+    DataFrame
+)
+adppk = filter(:COHORTC => !=("Placebo"), adppk)
+first(adppk,5)
+```
+
+
+
+## Dataset to be inspected interactively, to ensure consistency with the expected structure and content.
+
+```{julia}
+println("No. of rows in the DataFrame: ", nrow(adppk))
+println("No. of unique study participants: ", length(unique(adppk.USUBJID)))
+println("Total No. of Observations: ", count(==(0), adppk.EVID))
+```
+
+## Dataset overview
+
+```{julia}
+tbl = overview_table(adppk)
+io = IOBuffer()
+show(io, MIME"text/html"(), tbl)
+html_output = String(take!(io))
+write(joinpath(@__DIR__ ,"..","..","datasets","derived", "poppk_overview.html"), html_output)
+tbl
+```
+
+## Tabular Summary of Subject Characteristics
+
+```{julia}
+# Baseline characteristics
+# Note: Missing row appears only when there are missing values
+adata_subj = unique(adppk, :USUBJID) # Subset to one row per subject (USUBJID)
+table_one_mod( # bespoke function table_one_mod - renders Total column in the last. Use table_one to get it in the front.
+    adata_subj,
+    [
+        :SEX => "Sex",
+        :AGE => "Age [yr]",
+        :WTBL => "Baseline Weight [kg]",
+        :BMIBL => "Baseline BMI [kg/m²]",
+        :EGFRBL => "Baseline eGFR (CKD-2021) [mL/min/1.73 m²]"
+    ],
+    groupby=:STUDYID => "Study",
+    show_n=true,
+    footnotes=[
+        "Abbreviations: BMI = body mass index, CKD = chronic kidney disease, 
+        eGFR = estimated glomerular filtration rate, max = maximum, min = minimum, SD = Standard Deviation",
+        "Note: Missing row appears only when there are missing values"
+        ]
+)
+```
+
+## Correlation between covariates
+
+```{julia}
+
+pair_plot = @chain adppk begin
+    @select :STUDYIDN :USUBJID :AGE :BMIBL :EGFRBL :WTBL # select only covariate data & unique identifiers
+    unique # filter to keep only unique
+    @select :AGE :BMIBL :EGFRBL :WTBL
+    @rename begin # Renaming the columns
+        $("Age [yr]") = :AGE
+        $(:"BMI [kg/m²]") = :BMIBL
+        $(:"eGFR [mL/min/m²]") = :EGFRBL
+        $(:"Weight [kg]") = :WTBL
+    end
+    dropmissing
+
+    # The following function is defined in 20-poppk/julia-functions/pairplot-with-regression.
+    # Regression Line with CI Band is not available in PairPlots.jl
+    pairplot_with_regression(
+        color=:royalblue3,
+        title="Correlation between Continuous-Valued Covariates",
+        subtitle="CDISCPILOT01",
+        size=(800, 800)
+    )
+end
+```
+
+##  Visualize Covariate Distributions
+
+### Continuous variates
+
+```{julia}
+# Creating a Layer
+dist_layer = @chain adppk begin
+    @select :STUDYIDN :USUBJID :AGE :BMIBL :EGFRBL :WTBL # select only continuous covariate data & unique identifiers
+    unique # filter to keep only unique
+    @rename begin # Renaming the columns
+        $("Age [yr]") = :AGE
+        $(:"BMI [kg/m²]") = :BMIBL
+        $(:"eGFR [mL/min/m²]") = :EGFRBL
+        $(:"Weight [kg]") = :WTBL
+    end
+    stack(_, [:"Age [yr]", :"BMI [kg/m²]", :"eGFR [mL/min/m²]", :"Weight [kg]"])
+    dropmissing
+
+    data(_) *
+    mapping(
+        :value,
+        layout=:variable,
+        color=:variable,
+    )
+
+end
+```
+
+# Density Plot
+
+```{julia}
+density_plot = dist_layer *
+               AlgebraOfGraphics.density(datalimits=extrema)
+
+density_plot = draw(
+    density_plot,
+    figure=(
+        title="Density Plots of Continuous Covariates",
+        subtitle="CDISCPILOT01",
+        size=(800, 600)
+    ),
+    axis=(;
+        xlabel="",
+    ),
+    facet=(
+        linkyaxes=:none,
+        linkxaxes=:none,
+    ),
+    legend=(show=false,)
+)
+```
+
+
+```{julia}
+hist_plot = dist_layer *
+            AlgebraOfGraphics.histogram(bins=15, datalimits=extrema)
+
+hist_plot = draw(
+    hist_plot,
+    figure=(
+        title="Histograms of Continuous Covariates",
+        subtitle="CDISCPILOT01",
+        size=(800, 600)
+    ),
+    axis=(;
+        xlabel="",
+    ),
+    facet=(
+        linkyaxes=:none,
+        linkxaxes=:none,
+    ),
+    legend=(show=false,)
+)
+```
+
+## Categirocal variates
+
+```{julia}
+cat_cov = @chain adppk begin
+    @select :USUBJID :SEX # Select Categorical covariates
+    unique # Getting unique subjects - onw row per subject
+    @groupby :SEX
+    @combine :n = length(:USUBJID)
+    dropmissing
+
+
+    data(_) *
+    mapping(
+        :SEX,
+        :n,
+        color=:SEX
+    ) *
+    visual(BarPlot,
+        color=:lightblue
+    )
+end
+
+draw(cat_cov,
+    figure=(;
+        title="Barplots of Categorical Covariates",
+        subtitle="CDISCPILOT01"
+    ),
+    axis=(;
+        title="Sex",
+        yticks=0:10:50,
+        ylabel="Number of Subjects",
+        xlabel=""
+    ),
+    scales(;
+        Color=(;
+            palette=[:pink, :lightblue]
+        )
+    ),
+    legend=(;
+        show=false
+    )
+)
+```
+
+
+## Tabular Summary of assinged treatments
+
+```{julia}
+adata_subj = unique(adppk, :USUBJID) # Subset to one row per subject (USUBJID)
+adata_subj.TX = categorical(adata_subj.COHORTC, levels=unique(adata_subj.COHORTC))
+
+table_one_mod( # bespoke function table_one_mod - renders Total column in the last. Use table_one to get it in the front.
+    adata_subj,
+    [
+        :COHORTC => stats_cat => "Actual Treatment, n (%)"
+    ],
+    groupby=:STUDYID => "Study",
+    show_n=true,
+    # sort = true
+    # footnotes=["Abbreviations: BMI = body mass index, CKD = chronic kidney disease, eGFR = estimated glomerular filtration rate, max = maximum, min = minimum, SD = Standard Deviation"]
+)
+```
+
+## Tabular Summary of BLOQ by Nominal Time relative to previous dose
+
+```{julia}
+blq_smr = @chain adppk begin
+    @transform(:NFRLTC = @. string(round(:NFRLT, digits = 2)))
+    @rsubset :EVID == 0
+    @groupby :NFRLTC
+    @combine begin
+        :N = length(:DV)
+        :NBLQ = sum(:BLQFN)
+        :"BLQ [%]" = round(sum(:BLQFN) / length(:DV) * 100, digits = 1)
+    end
+end
+
+total_n = sum(blq_smr.N)
+total_nblq = sum(blq_smr.NBLQ)
+total_pc_nblq = round(sum(blq_smr.NBLQ) / total_n * 100, digits=1)
+
+# Formatting the TOTAL row to bold and making a DataFrame
+blq_tot_smr = DataFrame([
+    :NFRLTC => [styled"{bold:Total}"],
+    :N => [styled"{bold:$total_n}"],
+    :NBLQ => [styled"{bold:$total_nblq}"],
+    Symbol("BLQ [%]") => [styled"{bold:$total_pc_nblq}"]
+])
+
+@chain vcat(blq_smr, blq_tot_smr) begin
+    @rtransform begin
+        :NBLQ = :NBLQ == 0 ? "-" : :NBLQ
+        :"BLQ [%]" = :"BLQ [%]" == 0 ? "-" : :"BLQ [%]"
+    end
+
+    simple_table(
+        [
+            :NFRLTC => Annotated("Nominal Sampling Time [hr]", "Relative to previous dose", label="a"),
+            :N => Annotated("N", "Number of Samples", label="b"),
+            :NBLQ => Annotated("NBLQ", "Number of BLQ samples", label="c"),
+            Symbol("BLQ [%]")
+        ],
+        halign=[:left, :right, :right, :right]
+    )
+end
+```
+
+## Histograms of samples per subject
+
+```{julia}
+samples_hist = @chain adppk begin
+    # @rsubset :EVID == 0
+    @groupby :USUBJID :STUDYID
+    @combine :NOBS = length(:DV)
+    dropmissing
+
+    data(_) *
+    mapping(
+        :NOBS,
+        layout=:STUDYID
+    ) *
+    AlgebraOfGraphics.histogram(bins=25) *
+    visual(color=:lightblue)
+end
+
+draw(
+    samples_hist,
+    figure=(
+        title="Histogram of the Number of PK samples, by study",
+        subtitle="CDISCPILOT01"
+    ),
+    axis=(
+        yticks=0:10:100,
+        xticks=0:5:100,
+        xlabel="Number of Samples per Participant"
+    )
+)
+```
+
+## Histograms of Sampling Times
+### Relative to previous dose
+
+```{julia}
+dose_freq_lookup = DataFrame(
+    CDISC_VALUE = ["QD", "BID", "TID", "QID"],
+    HOURS_BETWEEN_DOSES = [24, 12, 8, 6]
+)
+```
+
+```{julia}
+adppk = @chain adppk begin
+    leftjoin(
+        dose_freq_lookup,
+        on = :HOURS_BETWEEN_DOSES,
+        matchmissing = :equal
+    )
+    rename(:CDISC_VALUE => :FREQC)
+    # @orderby([:STUDYID, :USUBJID, :EVID])
+
+end
+first(adppk,5)
+```
+
+```{julia}
+adppk = sort(adppk,[:STUDYID, :USUBJID, :EVID])
+first(adppk,5)
+
+```
+
+```{julia}
+dist_aprlt = @chain adppk begin
+    @rsubset begin
+        :EVID == 0
+        # :BLQFL == 0
+    end
+    # dropmissing
+
+    data(_) *
+    mapping(
+        :APRLT,
+        # row=:FREQC => sorter(["QD", "BID", "TID", "QID", missing])
+    ) *
+    AlgebraOfGraphics.histogram(bins=35, datalimits=extrema) *
+    visual(color=:lightblue)
+
+    draw(_,
+        figure=(
+            title="Histogram of Actual Time from First Dose, by Dosing Frequency",
+            subtitle="CDISCPILOT01",
+            size=(800, 600)
+        ),
+        axis=(;
+        # xticks = IntervalsBetween(3)
+        ),
+        facet=(
+            linkyaxes=:none,
+            linkxaxes=:none
+        )
+    )
+end
+
+# axes = dist_aprlt.figure.content
+
+# axes[1, 1].xticks = 0:6:100
+# axes[2, 1].xticks = 0:2:100
+# axes[3, 1].xticks = 0:1:100
+
+dist_aprlt
+
+
+
+```
+
+
+## Relative to First Dose
+
+```{julia}
+dist_nfrlt=@chain adppk begin
+    @rtransform :NFRLTD = :NFRLT / 24
+    @rsubset begin
+        :EVID == 0
+        # :BLQFL == 0
+    end
+
+    data(_) *
+    mapping(
+        :NFRLTD,
+        # row=:FREQC => sorter(["Single Dose", "QD", "BID"])
+    ) *
+    AlgebraOfGraphics.histogram(bins=35, datalimits=extrema, normalization=:none) *
+    visual(color=:lightblue)
+
+    draw(_,
+        figure=(
+            title="Histogram of Nominal Time from First Dose, by Dosing Frequency",
+            subtitle="CDISCPILOT01",
+            size=(800, 600)
+        ),
+        axis=(;
+        # xticks = 0:2:100,
+        xlabel = "Nominal Time Relative to First Dose [d]"
+        ),
+        facet=(
+            linkyaxes=:none,
+            linkxaxes=:none
+        )
+    )
+end
+
+# axes = dist_nfrlt.figure.content
+
+# axes[1, 1].xticks = 0:0.5:100
+# axes[2, 1].xticks = 0:2:100
+# axes[3, 1].xticks = 0:2:100
+
+dist_nfrlt
+```
+
+## Derive Plotting Data
+
+```{julia}
+pdata = @chain adppk begin
+    @rsubset :STUDYID == "CDISCPILOT01"
+
+    @transform :TXA = categorical(
+        ismissing(:FREQC) ? missing :
+        replace(:FREQC, r" \(QD\)" => "QD")
+    )
+
+    @rtransform :DNDV = :DV / :DOSEA     # dose-normalized DV
+
+    @select :USUBJID :NFRLT :AFRLT :EVID :AMT :DV :DNDV :BLQFL :FREQC :TXA :DOSEA
+end
+```
+
+```{julia}
+safe_median(x) = isempty(skipmissing(x)) ? missing : median(skipmissing(x))
+
+pdata_smr = @chain pdata begin
+    @rsubset(:EVID .== 0)
+    @groupby(:TXA, :NFRLT)
+     @combine(
+        :DVP50   = safe_median(:DV),
+        :DNDVP50 = safe_median(:DNDV),
+    )
+end
+```
+
+## Defining plot layers
+
+```{julia}
+individual_lines =
+    data(pdata) *
+    mapping(
+        :AFRLT,
+        :DV,
+        group=:USUBJID
+    ) *
+    visual(
+        Lines,
+        alpha = 0.5,
+        color=:gray75
+    )
+
+
+lloq_line =
+    mapping(0) *  # LLOQ = 5
+    visual(
+        HLines,
+        linestyle=:dash,
+        color=:red,
+        linewidth=1,
+        label="LLOQ (0 ng/mL)"
+    )
+
+rug_nfrlt =
+    mapping(unique(pdata_smr.NFRLT)) *
+    visual(VLines; color=:red, ymin=0, ymax=0.05, linewidth=1)
+
+median_layer =
+    data(pdata_smr) *
+    mapping(
+        :NFRLT,
+        :DVP50
+    ) *
+    visual(Lines)
+
+dn_median_layer =
+    data(pdata_smr) *
+    mapping(
+        :NFRLT,
+        :DNDVP50
+    ) *
+    visual(Lines)
+
+median_grouping =
+    mapping(
+        color=:TXA => sorter(unique(pdata_smr.TXA)),
+        linestyle=:TXA => sorter(unique(pdata_smr.TXA))
+    )
+
+layout_by_TXA =
+    mapping(layout=:TXA => sorter(unique(pdata_smr.TXA)))
+```
+
+## Median C-T Profiles
+
+```{julia}
+with_theme(my_log_theme) do
+    median_ct_plot =
+        (
+            median_layer * median_grouping
+            +
+            lloq_line
+            +
+            rug_nfrlt
+        ) |>
+        draw(
+            figure=(
+                title="Median Observed Concentration vs Time, by Dose Level",
+                subtitle="CDISCPILOT01",
+                size=(800, 600)
+            ),
+            axis=(ylabel="Plasma Concentration [ng/mL]",
+                limits=(nothing, nothing, nothing, nothing)
+            ),
+            legend=(
+                position=:bottom,
+                nbanks=2,
+                framevisible=false,
+                titlesize=0
+            )
+        )
+end
+```
+
+## Dose Normalized Median C-T Profiles
+
+```{julia}
+
+with_theme(my_log_theme) do
+    dn_median_ct_plot =
+        (
+            dn_median_layer * median_grouping
+            +
+            rug_nfrlt
+        ) |> draw(
+            figure=(
+                title="Median Dose-Normalized Observed Concentration vs Time, by Dose Level",
+                subtitle="CDISCPILOT01",
+                size=(800, 600)
+            ),
+            axis=(
+                ylabel="Plasma Concentration [ng/mL]",
+                limits=(nothing, nothing, nothing, nothing)
+            ),
+            legend=(
+                position=:bottom,
+                nbanks=2,
+                framevisible=false,
+                titlesize=0
+            )
+        )
+end
+```
+
